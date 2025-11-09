@@ -2944,6 +2944,12 @@ function navApplyHeadingToMarker(rawHeading) {
             console.log('[nav heading]', { heading, angleOffset, mapRotation, finalAngle });
         }
 
+        // 如果已经到达起点并开始导航，则锁定为路网方向，不再随设备或微移动抖动：
+        // 路网方向此处直接使用传入的 rawHeading（已按路径计算），忽略动态设备偏移后的结果。
+        if (hasReachedStart && isNavigating) {
+            finalAngle = heading; // 使用路径方向(未减地图旋转)，保持与路线平行视觉
+        }
+
         if (typeof userMarker.setAngle === 'function') userMarker.setAngle(finalAngle);
         else if (typeof userMarker.setRotation === 'function') userMarker.setRotation(finalAngle);
     } catch (err) {
@@ -4796,11 +4802,24 @@ function updatePathSegments(currentPos, fullPath, segIndex, projectionPoint) {
         }
     }
 
-    // 当前分段内走过的路径：从分段起点到实际走过的最远点
-    if (maxPassedOriginalIndex >= segmentStartIndex && fullPath && fullPath.length > 0) {
-        const endIdx = Math.min(maxPassedOriginalIndex + 1, fullPath.length);
-        passedPath = fullPath.slice(segmentStartIndex, endIdx);
-        console.log('灰色路径（第', currentSegmentNumber, '段）：从索引', segmentStartIndex, '到索引', maxPassedOriginalIndex, '共', passedPath.length, '个点');
+    // 当前分段内走过的路径：从分段起点到“当前投影点”实时延伸
+    // 实时延伸：即使尚未通过整段，也将当前投影位置加入灰线末尾
+    if (fullPath && fullPath.length > 0) {
+        const dynamicEndIndex = Math.max(segmentStartIndex, Math.min(routeSegIndex, fullPath.length - 1));
+        // 基础已走点：分段起点 -> 已走过的最远原始索引 或 当前段索引
+        let baseEnd = Math.max(segmentStartIndex, Math.min(maxPassedOriginalIndex, dynamicEndIndex));
+        // 切片（至少包含起点）
+        const sliceEnd = Math.min(baseEnd + 1, fullPath.length);
+        passedPath = fullPath.slice(segmentStartIndex, sliceEnd);
+        // 将当前投影点（routePoint）实时追加，避免等待整段完成
+        if (routePoint) {
+            const lastP = passedPath[passedPath.length - 1];
+            const distLast = lastP ? calculateDistanceBetweenPoints(lastP, routePoint) : Infinity;
+            if (distLast > 0.2) { // 避免重复点抖动
+                passedPath.push(routePoint);
+            }
+        }
+        console.log('[实时灰线] 第', currentSegmentNumber, '段：起点索引', segmentStartIndex, '动态段索引', routeSegIndex, '最远已走索引', maxPassedOriginalIndex, '灰点数', passedPath.length);
     }
 
     // 构建剩余路径（绿色）- 从实际走过的最远点到目标点
@@ -4820,8 +4839,8 @@ function updatePathSegments(currentPos, fullPath, segIndex, projectionPoint) {
         console.error('确定终点索引失败:', e);
     }
 
-    // 绿色路径从已走过的最远点之后开始
-    const startIdx = Math.max(0, maxPassedOriginalIndex);
+    // 绿色路径从“当前投影点”开始（实时），确保与灰线衔接
+    const startIdx = Math.max(0, routeSegIndex);
     const sliceEnd = Math.min(endIndex + 1, fullPath.length);
     if (startIdx < fullPath.length && startIdx < sliceEnd) {
         remainingPath = fullPath.slice(startIdx, sliceEnd);
