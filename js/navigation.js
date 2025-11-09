@@ -2445,6 +2445,50 @@ function computeDistanceToIndexMeters(point, path, targetIndex) {
     return dist;
 }
 
+// 判断掉头是否真正完成：不仅通过原始索引，还需角度与离开距离满足条件
+// 规则：
+// 1) 投影索引已进入掉头后的新段（proj.index > turnIdx）
+// 2) 从掉头枢轴点（turnIdx）沿路网前进的距离 >= uturnCompletionDistanceMeters（默认5m，可配置）
+// 3) 掉头角度绝对值 >= uturnCompletionAngleDegrees（默认140°，可配置）
+// 注意：若路径数据点过密，需保证 MIN_SEGMENT_LEN_M 不阻断角度计算；此处直接使用 calculateTurnAngle
+function isUturnCompleted(currPos, fullPath, turnIdx) {
+    try {
+        if (!fullPath || fullPath.length < 3) return false;
+        if (typeof turnIdx !== 'number' || turnIdx < 1 || turnIdx >= fullPath.length - 1) return false;
+        // 配置读取
+        let distNeed = 5; // 默认需要离开 pivot 5m
+        let angleNeed = 140; // 默认需要 >=140° 才算掉头
+        try {
+            if (MapConfig && MapConfig.navigationConfig) {
+                if (typeof MapConfig.navigationConfig.uturnCompletionDistanceMeters === 'number') {
+                    distNeed = MapConfig.navigationConfig.uturnCompletionDistanceMeters;
+                }
+                if (typeof MapConfig.navigationConfig.uturnCompletionAngleDegrees === 'number') {
+                    angleNeed = MapConfig.navigationConfig.uturnCompletionAngleDegrees;
+                }
+            }
+        } catch (e) {}
+
+        const proj = projectPointOntoPathMeters(currPos, fullPath);
+        if (!proj) return false;
+        if (proj.index <= turnIdx) return false; // 尚未进入后续段
+
+        // 计算从 pivot 到当前投影点的沿路网距离
+        const pivotPoint = fullPath[turnIdx];
+        const distFromPivot = computeDistanceToIndexMeters(pivotPoint, fullPath, proj.index) || 0;
+        if (!isFinite(distFromPivot) || distFromPivot < distNeed) return false;
+
+        // 计算掉头角度（进入与离开两段的折角）
+        const before = fullPath[turnIdx - 1];
+        const pivot = fullPath[turnIdx];
+        const after = fullPath[turnIdx + 1];
+        const turnAngle = Math.abs(calculateTurnAngle(before, pivot, after));
+        if (turnAngle < angleNeed) return false;
+
+        return true;
+    } catch (e) { return false; }
+}
+
 // 查找下一个转向点
 function findNextTurnPoint() {
     if (!navigationPath || navigationPath.length < 3) {
@@ -4327,7 +4371,21 @@ function startRealNavigationTracking() {
                         const targetIdx = turnSequence[turnSeqPtr].index;
                         if (typeof targetIdx === 'number' && targetIdx <= legEndIndex) {
                             // 判断是否已经走过这个转向点（基于实际吸附的索引）
+                            let passThisTurn = false;
                             if (maxPassedOriginalIndex >= targetIdx) {
+                                // 通用：索引已越过
+                                passThisTurn = true;
+                            } else {
+                                // 掉头特殊：允许在枢轴点后立即通过角度+距离判定为完成
+                                if (turnSequence[turnSeqPtr].type === 'uturn') {
+                                    const posForCheck = lastRenderPosNav || curr;
+                                    if (isUturnCompleted(posForCheck, fullPath, targetIdx)) {
+                                        passThisTurn = true;
+                                        console.log('判定掉头已完成 (角度+距离) 索引:', targetIdx);
+                                    }
+                                }
+                            }
+                            if (passThisTurn) {
                                 // 已经走过当前转向点，推进到下一个
                                 turnSeqPtr = Math.min(turnSeqPtr + 1, turnSequence.length);
                                 if (turnSeqPtr < turnSequence.length) {
