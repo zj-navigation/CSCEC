@@ -540,22 +540,17 @@ function displayKMLFeaturesForNavigation(features, fileName) {
     });
 
     // 2. 再处理线（zIndex: 20）
-    // 导航界面的KML线要素默认不显示，与开始导航后保持一致
+    // 导航界面的KML线要素使用统一样式：#9AE59D，线宽 1
     lines.forEach(feature => {
         if (feature.geometry?.coordinates && feature.geometry.coordinates.length >= 2) {
-            const lineStyle = feature.geometry.style || {
-                color: '#888888',
-                opacity: 0.5,
-                width: 2
-            };
-
+            // 强制使用需求指定的颜色与线宽
             const marker = new AMap.Polyline({
                 path: feature.geometry.coordinates,
-                strokeColor: lineStyle.color,
-                strokeWeight: lineStyle.width,
-                strokeOpacity: lineStyle.opacity || 0.5,
+                strokeColor: '#9AE59D',
+                strokeWeight: 1,
+                strokeOpacity: 1.0,
                 zIndex: 20,
-                map: navigationMap // 添加此行以在地图上显示
+                map: navigationMap // 在导航地图上显示
             });
 
             marker.setExtData({
@@ -1160,6 +1155,107 @@ function disableRouteArrows() {
             routePolyline.setOptions({ showDir: false });
         }
     } catch (e) {}
+}
+
+// ====== 开始导航后的车辆图标（与路网同宽） ======
+const VEHICLE_ICON_PATH = 'images/工地数字导航小程序切图/管理/4X/运输管理/临时车.png';
+const VEHICLE_ICON_RATIO = 1.92; // 素材纵横比（约 198/103）
+let VEHICLE_ICON_STATUS = 'unknown'; // 'ok' | 'fail' | 'unknown'
+let VEHICLE_ICON_FALLBACK_DATAURL_CACHE = null;
+
+// 获取路线线宽（像素），优先使用记录值，其次读取Polyline配置，最后回退默认10
+function getRouteVisualWidth() {
+    let w = 0;
+    try { if (typeof routeStrokeWeight === 'number' && routeStrokeWeight > 0) w = routeStrokeWeight; } catch (e) {}
+    if ((!w || w <= 0) && routePolyline) {
+        try {
+            const opt = typeof routePolyline.getOptions === 'function' ? routePolyline.getOptions() : null;
+            if (opt && typeof opt.strokeWeight === 'number') {
+                w = opt.strokeWeight;
+            }
+        } catch (e) {}
+    }
+    if (!w || w <= 0) w = 10;
+    return w;
+}
+
+// 生成简易的 SVG 车辆占位图（当PNG缺失时回退）
+function generateVehicleFallbackDataUrl(w, h) {
+    if (!VEHICLE_ICON_FALLBACK_DATAURL_CACHE) {
+        const body = `
+            <svg xmlns='http://www.w3.org/2000/svg' width='${w}' height='${h}' viewBox='0 0 103 198'>
+                <defs>
+                    <filter id='shadow' x='-20%' y='-20%' width='140%' height='140%'>
+                        <feDropShadow dx='0' dy='2' stdDeviation='3' flood-color='#000' flood-opacity='0.25'/>
+                    </filter>
+                </defs>
+                <g filter='url(#shadow)'>
+                    <rect x='16' y='6' rx='8' ry='8' width='71' height='186' fill='#FF9800' stroke='#D96C00' stroke-width='4'/>
+                    <rect x='20' y='70' width='63' height='100' fill='none' stroke='#FFB74D' stroke-width='4'/>
+                    <rect x='22' y='74' width='59' height='92' fill='none' stroke='#FFB74D' stroke-width='2'/>
+                    <rect x='22' y='20' width='59' height='32' fill='#333' rx='4' ry='4'/>
+                </g>
+            </svg>`;
+        VEHICLE_ICON_FALLBACK_DATAURL_CACHE = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(body);
+    }
+    return VEHICLE_ICON_FALLBACK_DATAURL_CACHE;
+}
+
+// 预加载车辆PNG，确定可用性
+function ensureVehicleIconLoaded(callback) {
+    if (VEHICLE_ICON_STATUS !== 'unknown') { callback && callback(); return; }
+    try {
+        const img = new Image();
+        img.onload = function() { VEHICLE_ICON_STATUS = 'ok'; callback && callback(); };
+        img.onerror = function() { VEHICLE_ICON_STATUS = 'fail'; callback && callback(); };
+        img.src = VEHICLE_ICON_PATH;
+    } catch (e) { VEHICLE_ICON_STATUS = 'fail'; callback && callback(); }
+}
+
+// 根据路线线宽构建车辆图标，缺失时回退到SVG
+function buildVehicleIcon() {
+    const w = getRouteVisualWidth();
+    const h = Math.max(Math.round(w * VEHICLE_ICON_RATIO), w);
+    const imageUrl = (VEHICLE_ICON_STATUS === 'fail') ? generateVehicleFallbackDataUrl(w, h) : VEHICLE_ICON_PATH;
+    return new AMap.Icon({
+        size: new AMap.Size(w, h),
+        image: imageUrl,
+        imageSize: new AMap.Size(w, h),
+        imageOffset: new AMap.Pixel(0, 0)
+    });
+}
+
+// 在开始导航后，将“我的位置”标记替换为车辆图标，尺寸与路线同宽，并置于路线之上
+function applyVehicleIconIfNavigating() {
+    try {
+        if (!isNavigating || !userMarker) return;
+        ensureVehicleIconLoaded(() => {
+            try {
+                const icon = buildVehicleIcon();
+                if (typeof userMarker.setIcon === 'function') {
+                    userMarker.setIcon(icon);
+                }
+                const w = getRouteVisualWidth();
+                const h = Math.max(Math.round(w * VEHICLE_ICON_RATIO), w);
+                if (typeof userMarker.setOffset === 'function') {
+                    userMarker.setOffset(new AMap.Pixel(-(w / 2), -(h / 2)));
+                }
+                // 确保车辆在绿色路线之上
+                let baseZ = 200;
+                try {
+                    if (routePolyline) {
+                        const opt = typeof routePolyline.getOptions === 'function' ? routePolyline.getOptions() : null;
+                        if (opt && typeof opt.zIndex === 'number') baseZ = opt.zIndex;
+                    }
+                } catch (e) {}
+                if (typeof userMarker.setzIndex === 'function') {
+                    userMarker.setzIndex(baseZ + 50);
+                }
+            } catch (e) { console.warn('应用车辆图标失败:', e); }
+        });
+    } catch (e) {
+        console.warn('应用车辆图标失败:', e);
+    }
 }
 
 // 调整地图视野
@@ -1858,6 +1954,9 @@ function startNavigationUI() {
 
     // 开启导航路线的白色方向箭头（仅在开始导航后）
     enableRouteArrows();
+
+    // 开始导航后，将“我的位置”替换为车辆图标（若已存在）
+    applyVehicleIconIfNavigating();
 
     console.log('导航已开始');
     try { speakNavigation('导航已开始，请注意行车安全'); } catch (e) {}
@@ -3350,6 +3449,9 @@ function startSimulatedNavigation() {
         map: navigationMap
     });
 
+    // 若此时已开始导航，替换为车辆图标并与路网同宽
+    applyVehicleIconIfNavigating();
+
     // 模拟行进参数
     const intervalMs = 300; // 刷新频率
     const metersPerTick = (VEHICLE_SPEED / 3600) * (intervalMs / 1000);
@@ -3946,6 +4048,9 @@ function startRealNavigationTracking() {
                 });
 
                 console.log('导航中我的位置标记创建成功');
+
+                // 开始导航后，立即替换为车辆图标
+                applyVehicleIconIfNavigating();
             }
 
             // === 新的吸附和偏离检测逻辑 ===
@@ -3979,69 +4084,33 @@ function startRealNavigationTracking() {
                 lastSnappedPointIndex = currentSnapIndex;
             }
 
-            // 计算朝向并旋转：根据前进/后退状态决定箭头方向
+            // 计算沿路网方向或移动向量方向（不使用设备传感器）
             let heading = null;
             if (hasReachedStart && onRoute && enhancedPathPoints.length >= 2 && currentSnapIndex >= 0) {
-                // 已到达起点且在路线上：根据前进/后退状态计算方向
                 if (movingForward) {
-                    // 前进：箭头指向下一个点
                     const nextIdx = Math.min(currentSnapIndex + 1, enhancedPathPoints.length - 1);
-                    const nextPoint = enhancedPathPoints[nextIdx].point;
-                    heading = calculateBearingBetweenPoints(displayPos, nextPoint);
-                    console.log('前进方向:', heading.toFixed(1), '度');
+                    heading = calculateBearingBetweenPoints(displayPos, enhancedPathPoints[nextIdx].point);
+                    console.log('前进方向(路网):', heading.toFixed(1), '度');
                 } else {
-                    // 后退：箭头指向上一个点
                     const prevIdx = Math.max(currentSnapIndex - 1, 0);
-                    const prevPoint = enhancedPathPoints[prevIdx].point;
-                    heading = calculateBearingBetweenPoints(displayPos, prevPoint);
-                    console.log('后退方向:', heading.toFixed(1), '度');
+                    heading = calculateBearingBetweenPoints(displayPos, enhancedPathPoints[prevIdx].point);
+                    console.log('后退方向(路网):', heading.toFixed(1), '度');
                 }
             }
-
-            // 回退方案：未到起点或无法获取路线方向时，使用设备方向或移动向量
-            if (heading === null) {
-                if (typeof lastDeviceHeadingNav === 'number') {
-                    heading = lastDeviceHeadingNav;
-                } else if (lastRenderPosNav) {
-                    const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
-                    if (moveDist > 0.5) {
-                        heading = calculateBearingBetweenPoints(lastRenderPosNav, displayPos);
-                    }
+            if (heading === null && lastRenderPosNav) {
+                const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
+                if (moveDist > 0.5) {
+                    heading = calculateBearingBetweenPoints(lastRenderPosNav, displayPos);
+                    console.log('回退方向(移动向量):', heading.toFixed(1), '度');
                 }
             }
-
-            // 使用"显示位置"进行自动校准与朝向应用
-            if (heading !== null) {
-                try {
-                    // 为了与吸附后的位置一致，使用显示位置推进校准状态
-                    if (lastRenderPosNav) { lastGpsPos = lastRenderPosNav; }
-                    // 注意：已到达起点后使用路线方向时，跳过自动校准（避免误判）
-                    if (!hasReachedStart || !onRoute) {
-                        attemptAutoCalibrationNav(displayPos, heading);
-                    }
-                    navApplyHeadingToMarker(heading);
-                } catch (e) {
-                    console.error('设置标记角度失败:', e);
-                }
-            }
-            // 更新标记显示位置与状态
-            userMarker.setPosition(displayPos);
-            lastRenderPosNav = displayPos;
-            lastGpsPos = displayPos;
-
-            // 更新偏离状态（基于新的5米吸附逻辑）
-            isOffRoute = !onRoute;
-            console.log('偏离状态:', isOffRoute ? '偏离' : '在路线上');
-
-            // 是否强制要求到达起点附近再开始
-            // 需求：未到达起点时，保持与“路线规划”一致的整条绿色路线
-            // 因此默认改为 true，只有接近起点后才正式开始分段导航
-            let requireStartAtOrigin = true;
             try {
-                if (MapConfig && MapConfig.navigationConfig && typeof MapConfig.navigationConfig.requireStartAtOrigin === 'boolean') {
-                    requireStartAtOrigin = MapConfig.navigationConfig.requireStartAtOrigin;
+                if (heading !== null) {
+                    navApplyHeadingToMarker(heading);
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.error('设置标记角度失败:', e);
+            }
 
             if (!hasReachedStart) {
                 if (requireStartAtOrigin) {
@@ -5078,6 +5147,9 @@ function startRealtimePositionTracking() {
                 });
 
                 console.log('导航页我的位置标记创建成功, marker:', userMarker);
+
+                // 若已开始导航，则改用车辆图标
+                applyVehicleIconIfNavigating();
             } else {
                 console.log('更新我的位置标记位置:', curr);
                 userMarker.setPosition(curr);
