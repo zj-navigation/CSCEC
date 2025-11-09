@@ -783,7 +783,7 @@ function displayKMLFeatures(features, fileName) {
     });
 
     // 2. 再显示线（zIndex: 50）
-    // 首页加载时不显示线要素，只在导航页显示
+    // 首页加载时不显示线要素；但仍创建对象。统一改为颜色 #9AE59D 线宽 1（需求：导入的线为细线）
     lines.forEach(feature => {
         const featureCoordinates = feature.geometry.coordinates;
 
@@ -801,19 +801,14 @@ function displayKMLFeatures(features, fileName) {
 
         allCoordinates.push(...featureCoordinates);
 
-        const lineStyle = feature.geometry.style || {
-            color: MapConfig.routeStyles.polyline.strokeColor,
-            width: MapConfig.routeStyles.polyline.strokeWeight
-        };
-
-        // 创建线要素但不添加到地图上（map参数不设置）
+        // 忽略原KML样式，使用统一的细线样式
         const marker = new AMap.Polyline({
             path: validCoords,
-            strokeColor: lineStyle.color,
-            strokeWeight: lineStyle.width,
-            strokeOpacity: lineStyle.opacity || 1,
+            strokeColor: '#9AE59D',
+            strokeWeight: 1,
+            strokeOpacity: 1.0,
             zIndex: 50
-            // 不添加 map: map，这样线要素不会显示在首页地图上
+            // 不添加 map: map，使其在首页不显示，仅供后续导航与图构建使用
         });
 
         marker.setExtData({
