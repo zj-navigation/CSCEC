@@ -42,6 +42,12 @@ let navTTS = null; // 可能为 XunfeiTTS 实例
 let navTTSQueue = [];
 let navTTSSpeaking = false;
 let navTTSSuppressionUntil = 0; // 时间戳：在此之前忽略重复播报
+// 语音播报状态，用于基于距离和动作类型做节流与阈值判断
+let navSpeechState = {
+    maneuverKey: null, // 当前动作标识（例如：left@123）
+    announced: new Set(), // 已播报的阈值集合（例如：'200','100'）
+    lastSpokenTime: 0
+};
 
 function initNavTTS() {
     try {
@@ -152,6 +158,86 @@ function processNavTTSQueue() {
             // 延迟下一条处理一点时间，避免极短间隔连续播放导致的冲突
             setTimeout(processNavTTSQueue, 120);
         });
+}
+
+// 重置当前动作的已播报阈值（当进入新动作或切换目标时调用）
+function resetManeuverAnnouncements() {
+    navSpeechState.maneuverKey = null;
+    navSpeechState.announced.clear();
+}
+
+// 判断是否应对当前动作进行播报（基于动作类型和到转弯点/目标的距离）
+// 返回 { shouldSpeak: boolean, suppressionMs: number, textOverride: string|null }
+function shouldSpeakForManeuver(directionType, distanceMeters, maneuverId) {
+    // 简单防抖: 若进入新动作，清空已播报阈值
+    if (!maneuverId) maneuverId = directionType;
+    if (navSpeechState.maneuverKey !== maneuverId) {
+        navSpeechState.maneuverKey = maneuverId;
+        navSpeechState.announced.clear();
+    }
+
+    const now = Date.now();
+
+    // 转向类（left/right/uturn/backward）使用多级阈值
+    if (directionType === 'left' || directionType === 'right' || directionType === 'uturn' || directionType === 'backward') {
+        const thresholds = [200, 100, 50, 20, 8];
+        for (const t of thresholds) {
+            if (distanceMeters <= t && !navSpeechState.announced.has(String(t))) {
+                navSpeechState.announced.add(String(t));
+                navSpeechState.lastSpokenTime = now;
+                // 更近的阈值使用更短的抑制时间
+                const suppression = t <= 8 ? 2000 : (t <= 20 ? 3000 : 4000);
+                return { shouldSpeak: true, suppressionMs: suppression, textOverride: null };
+            }
+        }
+        return { shouldSpeak: false, suppressionMs: 0, textOverride: null };
+    }
+
+    // 直行（forward/straight）: 降低频率，只有当距离较远首次报路况或较长时间未报才播报一次
+    if (directionType === 'forward' || directionType === 'straight') {
+        // 若为千米级，则主动播报一次
+        if (distanceMeters >= 1000 && !navSpeechState.announced.has('km')) {
+            navSpeechState.announced.add('km');
+            navSpeechState.lastSpokenTime = now;
+            return { shouldSpeak: true, suppressionMs: 15000, textOverride: null };
+        }
+        // 否则限制至少 20 秒才会再次播报直行提醒
+        if (now - navSpeechState.lastSpokenTime > 20000) {
+            navSpeechState.lastSpokenTime = now;
+            return { shouldSpeak: true, suppressionMs: 20000, textOverride: null };
+        }
+        return { shouldSpeak: false, suppressionMs: 0, textOverride: null };
+    }
+
+    // 偏离路线或其它情况，允许立即播报但抑制短时间重复
+    if (directionType === 'offroute') {
+        if (now - navSpeechState.lastSpokenTime > 5000) {
+            navSpeechState.lastSpokenTime = now;
+            return { shouldSpeak: true, suppressionMs: 5000, textOverride: null };
+        }
+        return { shouldSpeak: false, suppressionMs: 0, textOverride: null };
+    }
+
+    return { shouldSpeak: false, suppressionMs: 0, textOverride: null };
+}
+
+// 统一的“导航语音提示”封装：更新顶部文字并入队语音播报
+function speakNavigationTip(text, options) {
+    try {
+        // 更新顶部提示（保持文字与语音同步）
+        const tipTextElem = document.getElementById('tip-text');
+        if (tipTextElem && typeof text === 'string') {
+            tipTextElem.textContent = text;
+        }
+    } catch (e) {}
+
+    // 委托到通用播报接口
+    try {
+        speakNavigation(text, options || {});
+    } catch (e) {
+        console.warn('speakNavigationTip: speakNavigation 调用异常，回退到浏览器合成语音', e);
+        fallbackSpeak(text);
+    }
 }
 let isOffRoute = false;            // 是否偏离路径
 let offRouteThreshold = 5;         // 偏离路径阈值（米），设为5米
@@ -540,17 +626,22 @@ function displayKMLFeaturesForNavigation(features, fileName) {
     });
 
     // 2. 再处理线（zIndex: 20）
-    // 导航界面的KML线要素使用统一样式：#9AE59D，线宽 1
+    // 导航界面的KML线要素默认不显示，与开始导航后保持一致
     lines.forEach(feature => {
         if (feature.geometry?.coordinates && feature.geometry.coordinates.length >= 2) {
-            // 强制使用需求指定的颜色与线宽
+            const lineStyle = feature.geometry.style || {
+                color: '#888888',
+                opacity: 0.5,
+                width: 2
+            };
+
             const marker = new AMap.Polyline({
                 path: feature.geometry.coordinates,
-                strokeColor: '#9AE59D',
-                strokeWeight: 1,
-                strokeOpacity: 1.0,
+                strokeColor: lineStyle.color,
+                strokeWeight: lineStyle.width,
+                strokeOpacity: lineStyle.opacity || 0.5,
                 zIndex: 20,
-                map: navigationMap // 在导航地图上显示
+                map: navigationMap // 添加此行以在地图上显示
             });
 
             marker.setExtData({
@@ -1121,6 +1212,12 @@ function enableRouteArrows() {
     try {
         // 优先尝试 setOptions 切换
         if (typeof routePolyline.setOptions === 'function') {
+            try {
+                // 在启用箭头前适度密化路径点以提高箭头密度（默认间隔约8米）
+                const rawPath = typeof routePolyline.getPath === 'function' ? routePolyline.getPath() : [];
+                const densified = densifyPath(rawPath, 8);
+                if (densified && densified.length >= 2) routePolyline.setPath(densified);
+            } catch (e) { console.warn('densifyPath 失败:', e); }
             routePolyline.setOptions({ showDir: true, dirColor: '#FFFFFF' });
         } else {
             // 回退：重建 polyline 以启用 showDir
@@ -1147,6 +1244,28 @@ function enableRouteArrows() {
     }
 }
 
+// 将路径在每 segment 超过 spacingMeters 时插入中间点，提高路径点密度
+function densifyPath(path, spacingMeters) {
+    if (!Array.isArray(path) || path.length < 2) return path;
+    spacingMeters = spacingMeters || 8;
+    const out = [];
+    for (let i = 0; i < path.length - 1; i++) {
+        const a = normalizeLngLat(path[i]);
+        const b = normalizeLngLat(path[i + 1]);
+        out.push(a);
+        const segDist = calculateDistanceBetweenPoints(a, b);
+        if (segDist > spacingMeters) {
+            const parts = Math.ceil(segDist / spacingMeters);
+            for (let k = 1; k < parts; k++) {
+                const t = k / parts;
+                out.push(interpolateLngLat(a, b, t));
+            }
+        }
+    }
+    out.push(normalizeLngLat(path[path.length - 1]));
+    return out;
+}
+
 // 关闭导航路线的方向箭头
 function disableRouteArrows() {
     if (!routePolyline) return;
@@ -1155,107 +1274,6 @@ function disableRouteArrows() {
             routePolyline.setOptions({ showDir: false });
         }
     } catch (e) {}
-}
-
-// ====== 开始导航后的车辆图标（与路网同宽） ======
-const VEHICLE_ICON_PATH = 'images/工地数字导航小程序切图/管理/4X/运输管理/临时车.png';
-const VEHICLE_ICON_RATIO = 1.92; // 素材纵横比（约 198/103）
-let VEHICLE_ICON_STATUS = 'unknown'; // 'ok' | 'fail' | 'unknown'
-let VEHICLE_ICON_FALLBACK_DATAURL_CACHE = null;
-
-// 获取路线线宽（像素），优先使用记录值，其次读取Polyline配置，最后回退默认10
-function getRouteVisualWidth() {
-    let w = 0;
-    try { if (typeof routeStrokeWeight === 'number' && routeStrokeWeight > 0) w = routeStrokeWeight; } catch (e) {}
-    if ((!w || w <= 0) && routePolyline) {
-        try {
-            const opt = typeof routePolyline.getOptions === 'function' ? routePolyline.getOptions() : null;
-            if (opt && typeof opt.strokeWeight === 'number') {
-                w = opt.strokeWeight;
-            }
-        } catch (e) {}
-    }
-    if (!w || w <= 0) w = 10;
-    return w;
-}
-
-// 生成简易的 SVG 车辆占位图（当PNG缺失时回退）
-function generateVehicleFallbackDataUrl(w, h) {
-    if (!VEHICLE_ICON_FALLBACK_DATAURL_CACHE) {
-        const body = `
-            <svg xmlns='http://www.w3.org/2000/svg' width='${w}' height='${h}' viewBox='0 0 103 198'>
-                <defs>
-                    <filter id='shadow' x='-20%' y='-20%' width='140%' height='140%'>
-                        <feDropShadow dx='0' dy='2' stdDeviation='3' flood-color='#000' flood-opacity='0.25'/>
-                    </filter>
-                </defs>
-                <g filter='url(#shadow)'>
-                    <rect x='16' y='6' rx='8' ry='8' width='71' height='186' fill='#FF9800' stroke='#D96C00' stroke-width='4'/>
-                    <rect x='20' y='70' width='63' height='100' fill='none' stroke='#FFB74D' stroke-width='4'/>
-                    <rect x='22' y='74' width='59' height='92' fill='none' stroke='#FFB74D' stroke-width='2'/>
-                    <rect x='22' y='20' width='59' height='32' fill='#333' rx='4' ry='4'/>
-                </g>
-            </svg>`;
-        VEHICLE_ICON_FALLBACK_DATAURL_CACHE = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(body);
-    }
-    return VEHICLE_ICON_FALLBACK_DATAURL_CACHE;
-}
-
-// 预加载车辆PNG，确定可用性
-function ensureVehicleIconLoaded(callback) {
-    if (VEHICLE_ICON_STATUS !== 'unknown') { callback && callback(); return; }
-    try {
-        const img = new Image();
-        img.onload = function() { VEHICLE_ICON_STATUS = 'ok'; callback && callback(); };
-        img.onerror = function() { VEHICLE_ICON_STATUS = 'fail'; callback && callback(); };
-        img.src = VEHICLE_ICON_PATH;
-    } catch (e) { VEHICLE_ICON_STATUS = 'fail'; callback && callback(); }
-}
-
-// 根据路线线宽构建车辆图标，缺失时回退到SVG
-function buildVehicleIcon() {
-    const w = getRouteVisualWidth();
-    const h = Math.max(Math.round(w * VEHICLE_ICON_RATIO), w);
-    const imageUrl = (VEHICLE_ICON_STATUS === 'fail') ? generateVehicleFallbackDataUrl(w, h) : VEHICLE_ICON_PATH;
-    return new AMap.Icon({
-        size: new AMap.Size(w, h),
-        image: imageUrl,
-        imageSize: new AMap.Size(w, h),
-        imageOffset: new AMap.Pixel(0, 0)
-    });
-}
-
-// 在开始导航后，将“我的位置”标记替换为车辆图标，尺寸与路线同宽，并置于路线之上
-function applyVehicleIconIfNavigating() {
-    try {
-        if (!isNavigating || !userMarker) return;
-        ensureVehicleIconLoaded(() => {
-            try {
-                const icon = buildVehicleIcon();
-                if (typeof userMarker.setIcon === 'function') {
-                    userMarker.setIcon(icon);
-                }
-                const w = getRouteVisualWidth();
-                const h = Math.max(Math.round(w * VEHICLE_ICON_RATIO), w);
-                if (typeof userMarker.setOffset === 'function') {
-                    userMarker.setOffset(new AMap.Pixel(-(w / 2), -(h / 2)));
-                }
-                // 确保车辆在绿色路线之上
-                let baseZ = 200;
-                try {
-                    if (routePolyline) {
-                        const opt = typeof routePolyline.getOptions === 'function' ? routePolyline.getOptions() : null;
-                        if (opt && typeof opt.zIndex === 'number') baseZ = opt.zIndex;
-                    }
-                } catch (e) {}
-                if (typeof userMarker.setzIndex === 'function') {
-                    userMarker.setzIndex(baseZ + 50);
-                }
-            } catch (e) { console.warn('应用车辆图标失败:', e); }
-        });
-    } catch (e) {
-        console.warn('应用车辆图标失败:', e);
-    }
 }
 
 // 调整地图视野
@@ -1955,9 +1973,6 @@ function startNavigationUI() {
     // 开启导航路线的白色方向箭头（仅在开始导航后）
     enableRouteArrows();
 
-    // 开始导航后，将“我的位置”替换为车辆图标（若已存在）
-    applyVehicleIconIfNavigating();
-
     console.log('导航已开始');
     try { speakNavigation('导航已开始，请注意行车安全'); } catch (e) {}
 }
@@ -1988,6 +2003,8 @@ function stopNavigationUI() {
 
     console.log('导航已停止');
     try { speakNavigation('导航已停止'); } catch (e) {}
+    // 停止导航后恢复导航前的实时位置追踪，使“我的位置”图标回到设备实时位置
+    try { startRealtimePositionTracking(); } catch (e) { console.warn('恢复实时位置追踪失败:', e); }
 }
 
 // ====== 目标点管理逻辑 ======
@@ -2031,6 +2048,8 @@ function switchToNextTarget() {
                 console.log('切换目标点到途径点:', currentTargetPoint.name);
                 // 提升绿色路径层级
                 updateGreenPathZIndex();
+                // 切换目标时重置播报阈值，避免沿上一目标继续重复播报
+                try { resetManeuverAnnouncements(); } catch (e) {}
                 return;
             }
         }
@@ -2043,6 +2062,7 @@ function switchToNextTarget() {
         console.log('切换目标点到终点:', currentTargetPoint.name);
         // 提升绿色路径层级
         updateGreenPathZIndex();
+    try { resetManeuverAnnouncements(); } catch (e) {}
 
     } else if (currentType === 'waypoint') {
         // 从途径点切换到下一个途径点或终点
@@ -2059,6 +2079,7 @@ function switchToNextTarget() {
                 console.log('切换目标点到下一个途径点:', currentTargetPoint.name);
                 // 提升绿色路径层级
                 updateGreenPathZIndex();
+                try { resetManeuverAnnouncements(); } catch (e) {}
                 return;
             }
         }
@@ -2071,6 +2092,7 @@ function switchToNextTarget() {
         console.log('切换目标点到终点:', currentTargetPoint.name);
         // 提升绿色路径层级
         updateGreenPathZIndex();
+    try { resetManeuverAnnouncements(); } catch (e) {}
     }
     // 如果已经是终点，不再切换
 }
@@ -2224,6 +2246,36 @@ function updateNavigationTip() {
         const minutes = Math.ceil(hours * 60);
         estimatedTimeElem.textContent = minutes;
     }
+
+    // 若尚未真正开始（未到起点附近），保持并提示“请前往起点”——保持语音与顶部文本同步
+    try {
+        if (!hasReachedStart) {
+            const startPos = routeData && routeData.start && routeData.start.position ? routeData.start.position : null;
+            const currPos = userMarker ? [userMarker.getPosition().lng, userMarker.getPosition().lat] : null;
+            if (startPos && currPos) {
+                const distToStart = calculateDistanceBetweenPoints(currPos, startPos) || 0;
+                const pretty = distToStart > 1000 ? (distToStart/1000).toFixed(1) + '公里' : Math.round(distToStart) + '米';
+                const tip = `请前往起点，距离${pretty}`;
+                // 决策是否语音播报（使用一个专门的maneuver id）
+                try {
+                    const decision = shouldSpeakForManeuver('goto_start', distToStart, 'goto_start');
+                    if (decision && decision.shouldSpeak) {
+                        speakNavigationTip(tip, { suppressionMs: decision.suppressionMs });
+                    } else {
+                        // 仍然保持顶部文字同步
+                        const tipTextElem = document.getElementById('tip-text');
+                        if (tipTextElem) tipTextElem.textContent = tip;
+                    }
+                } catch (e) {
+                    // 回退：更新文字并以默认抑制播报
+                    try { document.getElementById('tip-text').textContent = tip; } catch (ex) {}
+                    try { speakNavigation(tip, { suppressionMs: 3000 }); } catch (ex) {}
+                }
+            }
+            // 未到起点时不需要继续执行后续转向提示逻辑
+            return;
+        }
+    } catch (e) {}
 
     // 更新下方卡片的目的地距离和时间
     const destinationDistanceElem = document.getElementById('destination-distance');
@@ -2382,34 +2434,29 @@ function updateNavigationTip() {
             // 生成播放文案（简单规则）：
             try {
                 const d = Math.round(distanceToNext || 0);
-                let msg = '';
-                if (directionType === 'left' || directionType === 'right' || directionType === 'uturn' || directionType === 'backward') {
-                    // 近距离提示使用“现在...”，否则使用“前方X米处...”
-                    if (d <= 8) {
-                        if (directionType === 'left') msg = '请现在左转';
-                        else if (directionType === 'right') msg = '请现在右转';
-                        else if (directionType === 'uturn' || directionType === 'backward') msg = '请在就地掉头';
+                try {
+                    const prebuilt = formatNavigationTip(directionType, d);
+                    const maneuverId = (typeof nextTurnIndex === 'number' && nextTurnIndex >= 0) ? `${directionType}@${nextTurnIndex}` : directionType;
+                    const decision = shouldSpeakForManeuver(directionType, d, maneuverId);
+                    if (prebuilt && decision && decision.shouldSpeak) {
+                        speakNavigationTip(prebuilt.speechText, { suppressionMs: decision.suppressionMs });
                     } else {
-                        if (directionType === 'left') msg = `前方${d}米处左转`;
-                        else if (directionType === 'right') msg = `前方${d}米处右转`;
-                        else if (directionType === 'uturn' || directionType === 'backward') msg = `前方${d}米处掉头`;
+                        // 即便不播报，也同步顶部文字显示
+                        try { const t = document.getElementById('tip-text'); if (t) t.textContent = prebuilt.speechText; } catch (ex) {}
                     }
-                } else if (directionType === 'forward' || directionType === 'straight') {
-                    if (d <= 20) msg = '继续直行';
-                    else msg = `继续直行，约${d}米`;
-                } else if (directionType === 'offroute') {
-                    msg = '您已偏离路线，请尽快回到规划路线';
-                }
-
-                if (msg) {
-                    // 限制短时间内重复播报，增加抑制时间到3秒，避免重复播报
-                    speakNavigation(msg, { suppressionMs: 3000 });
+                    // 将预构建文本传递给 UI 更新方法，确保显示与语音一致
+                    updateDirectionIcon(directionType, distanceToNext, { prebuiltTexts: prebuilt });
+                    // 提前返回，避免函数末尾再次调用 updateDirectionIcon
+                    return;
+                } catch (e) {
+                    console.warn('生成语音提示失败:', e);
                 }
             } catch (e) {
                 console.warn('生成语音提示失败:', e);
             }
         } catch (e) {}
-        updateDirectionIcon(directionType, distanceToNext);
+    // 如果上面未提前 return，则在此默认更新 UI（兼容老逻辑）
+    updateDirectionIcon(directionType, distanceToNext);
     
 }
 
@@ -3248,38 +3295,36 @@ function updateDirectionIcon(directionType, distanceToNext, options) {
         effectiveDirection = 'forward';
     }
 
-    switch (effectiveDirection) {
-        case 'forward':
-            iconPath = basePath + '直行.png';
-            actionName = '前进';
-            iconRotation = 0;
-            break;
-        case 'backward':
-            iconPath = basePath + '直行.png'; // 使用直行图标
-            actionName = '后退';
-            iconRotation = 180; // 旋转180度表示后退
-            break;
-        case 'left':
-            iconPath = basePath + '左转.png';
-            actionName = '左转';
-            iconRotation = 0;
-            break;
-        case 'right':
-            iconPath = basePath + '右转.png';
-            actionName = '右转';
-            iconRotation = 0;
-            break;
-        case 'uturn':
-            iconPath = basePath + '掉头.png';
-            actionName = '掉头';
-            iconRotation = 0;
-            break;
-        case 'straight':
-        default:
-            iconPath = basePath + '直行.png';
-            actionName = '直行';
-            iconRotation = 0;
-            break;
+    // 如果外部传入了预构建文本（确保UI与语音一致），则使用之
+    const prebuilt = options && options.prebuiltTexts ? options.prebuiltTexts : null;
+    if (prebuilt) {
+        // iconPath/actionName 仍按方向选择
+        switch (effectiveDirection) {
+            case 'forward': iconPath = basePath + '直行.png'; actionName = '前进'; iconRotation = 0; break;
+            case 'backward': iconPath = basePath + '直行.png'; actionName = '后退'; iconRotation = 180; break;
+            case 'left': iconPath = basePath + '左转.png'; actionName = '左转'; iconRotation = 0; break;
+            case 'right': iconPath = basePath + '右转.png'; actionName = '右转'; iconRotation = 0; break;
+            case 'uturn': iconPath = basePath + '掉头.png'; actionName = '掉头'; iconRotation = 0; break;
+            case 'straight':
+            default: iconPath = basePath + '直行.png'; actionName = '直行'; iconRotation = 0; break;
+        }
+
+        // 使用预构建文本来设置 UI，使显示与语音严格一致
+        if (directionImg) {
+            directionImg.src = iconPath;
+            directionImg.alt = actionName;
+            if (iconRotation !== 0) directionImg.style.transform = `rotate(${iconRotation}deg)`;
+            else directionImg.style.transform = 'none';
+        }
+
+        if (tipDetailsElem) tipDetailsElem.style.display = 'flex';
+        if (tipDividerElem) tipDividerElem.style.display = 'block';
+
+        if (distanceAheadElem) distanceAheadElem.textContent = prebuilt.distanceText || '';
+        if (actionText) actionText.textContent = prebuilt.actionText || '';
+        if (distanceUnitElem) distanceUnitElem.style.display = prebuilt.showDistanceUnit ? 'inline' : 'none';
+
+        return;
     }
 
     // 更新图标
@@ -3321,6 +3366,72 @@ function updateDirectionIcon(directionType, distanceToNext, options) {
             distanceUnitElem.style.display = 'inline';
         }
     }
+}
+
+// 将方向与距离格式化为用于 UI 和 TTS 的文本（确保两者一致）
+function formatNavigationTip(directionType, distanceToNext) {
+    const distance = Math.round(distanceToNext || 0);
+    // 计算 turnPromptThreshold 与 farFromNextTurn 一致的逻辑
+    let turnPromptThreshold = 40;
+    try { if (MapConfig && MapConfig.navigationConfig && typeof MapConfig.navigationConfig.turnPromptDistanceMeters === 'number') turnPromptThreshold = MapConfig.navigationConfig.turnPromptDistanceMeters; } catch (e) {}
+    const farFromNextTurn = isFinite(distance) && distance > turnPromptThreshold;
+    let effectiveDirection = directionType;
+    if (farFromNextTurn && directionType !== 'offroute' && directionType !== 'backward' && directionType !== 'uturn') {
+        effectiveDirection = 'forward';
+    }
+
+    // 构建 UI 文本与播报文本
+    const out = { uiDistanceText: '', actionText: '', showDistanceUnit: false, speechText: '' };
+
+    if (isOffRoute) {
+        out.uiDistanceText = '';
+        out.actionText = !hasReachedStart ? '请前往起点' : '请回到规划路线';
+        out.showDistanceUnit = false;
+        out.speechText = out.actionText;
+        return { distanceText: out.uiDistanceText, actionText: out.actionText, showDistanceUnit: out.showDistanceUnit, speechText: out.speechText };
+    }
+
+    switch (effectiveDirection) {
+        case 'forward':
+            out.uiDistanceText = '沿当前道路行驶 ' + distance;
+            out.actionText = '米';
+            out.showDistanceUnit = false;
+            out.speechText = distance <= 20 ? '继续直行' : `继续直行，约${distance}米`;
+            break;
+        case 'backward':
+            out.uiDistanceText = distance;
+            out.actionText = '后退';
+            out.showDistanceUnit = true;
+            out.speechText = distance <= 8 ? '请就地后退' : `约${distance}米后请后退`;
+            break;
+        case 'left':
+            out.uiDistanceText = distance;
+            out.actionText = distance <= 8 ? '请现在左转' : `米后 左转`;
+            out.showDistanceUnit = true;
+            out.speechText = distance <= 8 ? '请现在左转' : `前方${distance}米处左转`;
+            break;
+        case 'right':
+            out.uiDistanceText = distance;
+            out.actionText = distance <= 8 ? '请现在右转' : `米后 右转`;
+            out.showDistanceUnit = true;
+            out.speechText = distance <= 8 ? '请现在右转' : `前方${distance}米处右转`;
+            break;
+        case 'uturn':
+            out.uiDistanceText = distance;
+            out.actionText = '掉头';
+            out.showDistanceUnit = true;
+            out.speechText = distance <= 8 ? '请就地掉头' : `前方${distance}米处掉头`;
+            break;
+        case 'straight':
+        default:
+            out.uiDistanceText = '沿当前道路行驶 ' + distance;
+            out.actionText = '米';
+            out.showDistanceUnit = false;
+            out.speechText = distance <= 20 ? '继续直行' : `继续直行，约${distance}米`;
+            break;
+    }
+
+    return { distanceText: out.uiDistanceText, actionText: out.actionText, showDistanceUnit: out.showDistanceUnit, speechText: out.speechText };
 }
 
 
@@ -3448,9 +3559,6 @@ function startSimulatedNavigation() {
         angle: 0,
         map: navigationMap
     });
-
-    // 若此时已开始导航，替换为车辆图标并与路网同宽
-    applyVehicleIconIfNavigating();
 
     // 模拟行进参数
     const intervalMs = 300; // 刷新频率
@@ -4048,9 +4156,6 @@ function startRealNavigationTracking() {
                 });
 
                 console.log('导航中我的位置标记创建成功');
-
-                // 开始导航后，立即替换为车辆图标
-                applyVehicleIconIfNavigating();
             }
 
             // === 新的吸附和偏离检测逻辑 ===
@@ -4084,33 +4189,69 @@ function startRealNavigationTracking() {
                 lastSnappedPointIndex = currentSnapIndex;
             }
 
-            // 计算沿路网方向或移动向量方向（不使用设备传感器）
+            // 计算朝向并旋转：根据前进/后退状态决定箭头方向
             let heading = null;
             if (hasReachedStart && onRoute && enhancedPathPoints.length >= 2 && currentSnapIndex >= 0) {
+                // 已到达起点且在路线上：根据前进/后退状态计算方向
                 if (movingForward) {
+                    // 前进：箭头指向下一个点
                     const nextIdx = Math.min(currentSnapIndex + 1, enhancedPathPoints.length - 1);
-                    heading = calculateBearingBetweenPoints(displayPos, enhancedPathPoints[nextIdx].point);
-                    console.log('前进方向(路网):', heading.toFixed(1), '度');
+                    const nextPoint = enhancedPathPoints[nextIdx].point;
+                    heading = calculateBearingBetweenPoints(displayPos, nextPoint);
+                    console.log('前进方向:', heading.toFixed(1), '度');
                 } else {
+                    // 后退：箭头指向上一个点
                     const prevIdx = Math.max(currentSnapIndex - 1, 0);
-                    heading = calculateBearingBetweenPoints(displayPos, enhancedPathPoints[prevIdx].point);
-                    console.log('后退方向(路网):', heading.toFixed(1), '度');
+                    const prevPoint = enhancedPathPoints[prevIdx].point;
+                    heading = calculateBearingBetweenPoints(displayPos, prevPoint);
+                    console.log('后退方向:', heading.toFixed(1), '度');
                 }
             }
-            if (heading === null && lastRenderPosNav) {
-                const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
-                if (moveDist > 0.5) {
-                    heading = calculateBearingBetweenPoints(lastRenderPosNav, displayPos);
-                    console.log('回退方向(移动向量):', heading.toFixed(1), '度');
+
+            // 回退方案：未到起点或无法获取路线方向时，使用设备方向或移动向量
+            if (heading === null) {
+                if (typeof lastDeviceHeadingNav === 'number') {
+                    heading = lastDeviceHeadingNav;
+                } else if (lastRenderPosNav) {
+                    const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
+                    if (moveDist > 0.5) {
+                        heading = calculateBearingBetweenPoints(lastRenderPosNav, displayPos);
+                    }
                 }
             }
-            try {
-                if (heading !== null) {
+
+            // 使用"显示位置"进行自动校准与朝向应用
+            if (heading !== null) {
+                try {
+                    // 为了与吸附后的位置一致，使用显示位置推进校准状态
+                    if (lastRenderPosNav) { lastGpsPos = lastRenderPosNav; }
+                    // 注意：已到达起点后使用路线方向时，跳过自动校准（避免误判）
+                    if (!hasReachedStart || !onRoute) {
+                        attemptAutoCalibrationNav(displayPos, heading);
+                    }
                     navApplyHeadingToMarker(heading);
+                } catch (e) {
+                    console.error('设置标记角度失败:', e);
                 }
-            } catch (e) {
-                console.error('设置标记角度失败:', e);
             }
+            // 更新标记显示位置与状态
+            userMarker.setPosition(displayPos);
+            lastRenderPosNav = displayPos;
+            lastGpsPos = displayPos;
+
+            // 更新偏离状态（基于新的5米吸附逻辑）
+            isOffRoute = !onRoute;
+            console.log('偏离状态:', isOffRoute ? '偏离' : '在路线上');
+
+            // 是否强制要求到达起点附近再开始
+            // 需求：未到达起点时，保持与“路线规划”一致的整条绿色路线
+            // 因此默认改为 true，只有接近起点后才正式开始分段导航
+            let requireStartAtOrigin = true;
+            try {
+                if (MapConfig && MapConfig.navigationConfig && typeof MapConfig.navigationConfig.requireStartAtOrigin === 'boolean') {
+                    requireStartAtOrigin = MapConfig.navigationConfig.requireStartAtOrigin;
+                }
+            } catch (e) {}
 
             if (!hasReachedStart) {
                 if (requireStartAtOrigin) {
@@ -5147,9 +5288,6 @@ function startRealtimePositionTracking() {
                 });
 
                 console.log('导航页我的位置标记创建成功, marker:', userMarker);
-
-                // 若已开始导航，则改用车辆图标
-                applyVehicleIconIfNavigating();
             } else {
                 console.log('更新我的位置标记位置:', curr);
                 userMarker.setPosition(curr);
