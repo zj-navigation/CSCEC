@@ -4089,17 +4089,17 @@ function startRealNavigationTracking() {
             if (isNavigating) {
                 // 已开始导航：若吸附到路网，则按前进/后退取路径方向；否则用最近移动向量，避免使用设备罗盘
                 if (enhancedPathPoints.length >= 2 && currentSnapIndex >= 0) {
-                    if (movingForward) {
-                        const nextIdx = Math.min(currentSnapIndex + 1, enhancedPathPoints.length - 1);
-                        const nextPoint = enhancedPathPoints[nextIdx].point;
-                        heading = calculateBearingBetweenPoints(displayPos, nextPoint);
+                if (movingForward) {
+                    const nextIdx = Math.min(currentSnapIndex + 1, enhancedPathPoints.length - 1);
+                    const nextPoint = enhancedPathPoints[nextIdx].point;
+                    heading = calculateBearingBetweenPoints(displayPos, nextPoint);
                         console.log('[导航方向] 前进 bearing:', heading.toFixed(1));
-                    } else {
-                        const prevIdx = Math.max(currentSnapIndex - 1, 0);
-                        const prevPoint = enhancedPathPoints[prevIdx].point;
-                        heading = calculateBearingBetweenPoints(displayPos, prevPoint);
+                } else {
+                    const prevIdx = Math.max(currentSnapIndex - 1, 0);
+                    const prevPoint = enhancedPathPoints[prevIdx].point;
+                    heading = calculateBearingBetweenPoints(displayPos, prevPoint);
                         console.log('[导航方向] 后退 bearing:', heading.toFixed(1));
-                    }
+                }
                 } else if (lastRenderPosNav) {
                     const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
                     if (moveDist > 0.5) {
