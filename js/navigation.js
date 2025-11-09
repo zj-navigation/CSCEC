@@ -175,18 +175,12 @@ let currentTargetPoint = null;     // 当前目标点：{ type: 'start'|'waypoin
 let currentBranchInfo = null;      // 当前检测到的分支信息
 let userChosenBranch = -1;         // 用户选择的分支索引（-1表示未选择或推荐分支）
 let lastBranchNotificationTime = 0; // 上次分支提示的时间戳，避免频繁提示
-// 接近起点自动“以我为起点”阈值（米）
+// 接近起点自动"以我为起点"阈值（米）
 let startRebaseThresholdMeters = 25; // 可按需微调，建议20~30米
-// 终点到达判定的沿路网剩余距离阈值（米）
-let endArrivalThresholdMeters = 12; // 建议10~15米，避免误判
 try {
     if (typeof MapConfig !== 'undefined' && MapConfig && MapConfig.navigationConfig &&
         typeof MapConfig.navigationConfig.startRebaseDistanceMeters === 'number') {
         startRebaseThresholdMeters = MapConfig.navigationConfig.startRebaseDistanceMeters;
-    }
-    if (typeof MapConfig !== 'undefined' && MapConfig && MapConfig.navigationConfig &&
-        typeof MapConfig.navigationConfig.endArrivalDistanceMeters === 'number') {
-        endArrivalThresholdMeters = MapConfig.navigationConfig.endArrivalDistanceMeters;
     }
 } catch (e) { /* 忽略配置读取错误，使用默认值 */ }
 
@@ -3900,10 +3894,6 @@ function startRealNavigationTracking() {
         navigationMap.remove(userMarker);
         userMarker = null;
     }
-    if (accuracyCircle && navigationMap) {
-        navigationMap.remove(accuracyCircle);
-        accuracyCircle = null;
-    }
     // 清理所有分段的灰色路径
     if (passedSegmentPolylines && passedSegmentPolylines.length > 0) {
         passedSegmentPolylines.forEach(polyline => {
@@ -4367,25 +4357,12 @@ function startRealNavigationTracking() {
                 updateNavigationTip();
             }
 
-            // 到终点判定（使用沿路网的剩余距离）
-            const end = fullPath[fullPath.length - 1];
-            const distToEnd = calculateDistanceBetweenPoints(lastRenderPosNav || curr, end);
+            // 到终点判定（精确索引匹配）
+            const endIndex = fullPath.length - 1;
 
-            // 使用吸附索引计算沿路网剩余距离
-            let remainRouteDist = distToEnd;
-            if (maxPassedOriginalIndex >= 0 && maxPassedOriginalIndex < fullPath.length - 1) {
-                remainRouteDist = 0;
-                // 从当前位置到当前段终点
-                remainRouteDist += calculateDistanceBetweenPoints(lastRenderPosNav || curr, fullPath[maxPassedOriginalIndex + 1]);
-                // 剩余各段累加
-                for (let j = maxPassedOriginalIndex + 1; j < fullPath.length - 1; j++) {
-                    remainRouteDist += calculateDistanceBetweenPoints(fullPath[j], fullPath[j + 1]);
-                }
-            }
-
-            const nearByRoute = remainRouteDist <= endArrivalThresholdMeters;
-            const nearByAir = distToEnd <= Math.max(endArrivalThresholdMeters * 1.5, 10); // 双重保险：物理距离也接近
-            if (hasReachedStart && onRoute && nearByRoute && nearByAir) {
+            // 只有当吸附到终点索引时才算到达
+            if (hasReachedStart && onRoute && maxPassedOriginalIndex === endIndex) {
+                console.log('到达终点 (路径索引:', endIndex, ')');
                 finishNavigation();
                 // 到达后停止持续定位
                 stopRealNavigationTracking();
@@ -4439,14 +4416,9 @@ function getNearestUnvisitedWaypointDistanceMeters(currPos, path, wptMap) {
 
 function markWaypointArrivalIfNeeded(currPos, path) {
     if (!Array.isArray(path) || path.length < 2 || !Array.isArray(waypointIndexMap) || waypointIndexMap.length === 0) return;
-    let arriveThresh = 15; // 默认15米
-    try {
-        if (MapConfig && MapConfig.navigationConfig && typeof MapConfig.navigationConfig.waypointArrivalDistanceMeters === 'number') {
-            arriveThresh = MapConfig.navigationConfig.waypointArrivalDistanceMeters;
-        }
-    } catch (e) {}
 
-    // === 基于实际吸附点判断途径点到达 ===
+    // === 基于精确索引匹配判断途径点到达 ===
+    // 只有当实际走过的最远索引精确等于途径点索引时才算到达
     if (maxPassedOriginalIndex < 0) return; // 还没有吸附到任何点
 
     for (let i = 0; i < waypointIndexMap.length; i++) {
@@ -4454,10 +4426,10 @@ function markWaypointArrivalIfNeeded(currPos, path) {
         if (!w || visitedWaypoints.has(w.name)) continue;
         if (typeof w.index !== 'number') continue;
 
-        // 判断：如果实际走过的最远索引已经达到或超过途径点索引
-        if (maxPassedOriginalIndex >= w.index) {
+        // 精确匹配：吸附到途径点的路径索引才算到达
+        if (maxPassedOriginalIndex === w.index) {
             visitedWaypoints.add(w.name);
-            console.log('到达途径点:', w.name, '(索引:', w.index, ')');
+            console.log('到达途径点:', w.name, '(路径索引:', w.index, ')');
 
             // === 计算途径点序号并播报 ===
             const waypointNumber = i + 1; // 序号从1开始
@@ -4511,7 +4483,6 @@ function stopRealNavigationTracking() {
     }
     lastGpsPos = null;
     if (userMarker && navigationMap) { navigationMap.remove(userMarker); userMarker = null; }
-    if (accuracyCircle && navigationMap) { navigationMap.remove(accuracyCircle); accuracyCircle = null; }
 
     // 清理所有分段的灰色路径
     if (passedSegmentPolylines && passedSegmentPolylines.length > 0) {
@@ -5160,9 +5131,8 @@ function startRealtimePositionTracking() {
             // 注意:起点坐标已在loadRouteData()阶段从sessionStorage读取并修正,
             // 这里不需要再次更新,避免重复规划路线
 
-            // 获取GPS精度并更新精度圈
+            // 获取GPS精度
             const accuracy = pos.coords.accuracy || 10; // 默认10米
-            updateAccuracyCircle(curr, accuracy);
             console.log('GPS精度:', accuracy, '米');
 
             // 创建或更新"我的位置"标记
@@ -5273,10 +5243,5 @@ function stopRealtimePositionTracking() {
             console.error('停止位置追踪失败:', e);
         }
         preNavWatchId = null;
-    }
-    // 清理精度圈
-    if (accuracyCircle && navigationMap) {
-        navigationMap.remove(accuracyCircle);
-        accuracyCircle = null;
     }
 }
