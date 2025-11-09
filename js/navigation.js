@@ -5035,10 +5035,13 @@ function tryStartDeviceOrientationNav() {
             // 保存最新朝向，供其他逻辑（例如 GPS 更新）使用
             lastDeviceHeadingNav = heading;
 
-            // 如果"我的位置"标记已存在，则尝试设置其旋转角度
+            // 如果"我的位置"标记已存在：
+            // 未开始导航前，允许用设备朝向驱动图标；
+            // 一旦到达起点并开始导航，则不再用设备朝向更新，避免覆盖路网方向锁定。
             if (userMarker) {
-                // 统一封装：角度偏移与地图旋转在内部处理
-                try { navApplyHeadingToMarker(heading); } catch (err) {}
+                if (!(isNavigating && hasReachedStart)) {
+                    try { navApplyHeadingToMarker(heading); } catch (err) {}
+                }
             }
 
             // 若正在导航，设备朝向变化也应触发提示刷新（支持“基于朝向”的提示在原地转向时即时更新）
