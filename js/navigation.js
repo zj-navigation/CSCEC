@@ -4084,33 +4084,73 @@ function startRealNavigationTracking() {
                 lastSnappedPointIndex = currentSnapIndex;
             }
 
-            // 计算沿路网方向或移动向量方向（不使用设备传感器）
+            // 计算朝向：导航开始后优先使用路网方向；未开始导航则保持原逻辑
             let heading = null;
-            if (hasReachedStart && onRoute && enhancedPathPoints.length >= 2 && currentSnapIndex >= 0) {
-                if (movingForward) {
-                    const nextIdx = Math.min(currentSnapIndex + 1, enhancedPathPoints.length - 1);
-                    heading = calculateBearingBetweenPoints(displayPos, enhancedPathPoints[nextIdx].point);
-                    console.log('前进方向(路网):', heading.toFixed(1), '度');
-                } else {
-                    const prevIdx = Math.max(currentSnapIndex - 1, 0);
-                    heading = calculateBearingBetweenPoints(displayPos, enhancedPathPoints[prevIdx].point);
-                    console.log('后退方向(路网):', heading.toFixed(1), '度');
+            if (isNavigating) {
+                // 已开始导航：若吸附到路网，则按前进/后退取路径方向；否则用最近移动向量，避免使用设备罗盘
+                if (enhancedPathPoints.length >= 2 && currentSnapIndex >= 0) {
+                    if (movingForward) {
+                        const nextIdx = Math.min(currentSnapIndex + 1, enhancedPathPoints.length - 1);
+                        const nextPoint = enhancedPathPoints[nextIdx].point;
+                        heading = calculateBearingBetweenPoints(displayPos, nextPoint);
+                        console.log('[导航方向] 前进 bearing:', heading.toFixed(1));
+                    } else {
+                        const prevIdx = Math.max(currentSnapIndex - 1, 0);
+                        const prevPoint = enhancedPathPoints[prevIdx].point;
+                        heading = calculateBearingBetweenPoints(displayPos, prevPoint);
+                        console.log('[导航方向] 后退 bearing:', heading.toFixed(1));
+                    }
+                } else if (lastRenderPosNav) {
+                    const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
+                    if (moveDist > 0.5) {
+                        heading = calculateBearingBetweenPoints(lastRenderPosNav, displayPos);
+                        console.log('[导航方向回退] 使用移动向量 bearing:', heading.toFixed(1));
+                    }
+                }
+            } else {
+                // 未开始导航：允许使用设备罗盘方向
+                if (typeof lastDeviceHeadingNav === 'number') {
+                    heading = lastDeviceHeadingNav;
+                } else if (lastRenderPosNav) {
+                    const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
+                    if (moveDist > 0.5) {
+                        heading = calculateBearingBetweenPoints(lastRenderPosNav, displayPos);
+                    }
                 }
             }
-            if (heading === null && lastRenderPosNav) {
-                const moveDist = calculateDistanceBetweenPoints(lastRenderPosNav, displayPos);
-                if (moveDist > 0.5) {
-                    heading = calculateBearingBetweenPoints(lastRenderPosNav, displayPos);
-                    console.log('回退方向(移动向量):', heading.toFixed(1), '度');
-                }
-            }
-            try {
-                if (heading !== null) {
+
+            // 使用"显示位置"进行自动校准与朝向应用
+            if (heading !== null) {
+                try {
+                    // 为了与吸附后的位置一致，使用显示位置推进校准状态
+                    if (lastRenderPosNav) { lastGpsPos = lastRenderPosNav; }
+                    // 注意：已到达起点后使用路线方向时，跳过自动校准（避免误判）
+                    if (!hasReachedStart || !onRoute) {
+                        attemptAutoCalibrationNav(displayPos, heading);
+                    }
                     navApplyHeadingToMarker(heading);
+                } catch (e) {
+                    console.error('设置标记角度失败:', e);
                 }
-            } catch (e) {
-                console.error('设置标记角度失败:', e);
             }
+            // 更新标记显示位置与状态
+            userMarker.setPosition(displayPos);
+            lastRenderPosNav = displayPos;
+            lastGpsPos = displayPos;
+
+            // 更新偏离状态（基于新的5米吸附逻辑）
+            isOffRoute = !onRoute;
+            console.log('偏离状态:', isOffRoute ? '偏离' : '在路线上');
+
+            // 是否强制要求到达起点附近再开始
+            // 需求：未到达起点时，保持与“路线规划”一致的整条绿色路线
+            // 因此默认改为 true，只有接近起点后才正式开始分段导航
+            let requireStartAtOrigin = true;
+            try {
+                if (MapConfig && MapConfig.navigationConfig && typeof MapConfig.navigationConfig.requireStartAtOrigin === 'boolean') {
+                    requireStartAtOrigin = MapConfig.navigationConfig.requireStartAtOrigin;
+                }
+            } catch (e) {}
 
             if (!hasReachedStart) {
                 if (requireStartAtOrigin) {
