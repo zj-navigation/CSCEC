@@ -1160,6 +1160,7 @@ function disableRouteArrows() {
 // ====== 开始导航后的车辆图标（与路网同宽） ======
 const VEHICLE_ICON_PATH = 'images/工地数字导航小程序切图/管理/4X/运输管理/临时车.png';
 const VEHICLE_ICON_RATIO = 1.92; // 素材纵横比（约 198/103）
+const VEHICLE_ICON_SCALE = 2; // 车辆图标放大倍率（需求：加大一倍）
 let VEHICLE_ICON_STATUS = 'unknown'; // 'ok' | 'fail' | 'unknown'
 let VEHICLE_ICON_FALLBACK_DATAURL_CACHE = null;
 
@@ -1214,7 +1215,9 @@ function ensureVehicleIconLoaded(callback) {
 
 // 根据路线线宽构建车辆图标，缺失时回退到SVG
 function buildVehicleIcon() {
-    const w = getRouteVisualWidth();
+    // 放大宽度后再按比例计算高度
+    const baseW = getRouteVisualWidth();
+    const w = Math.max(1, Math.round(baseW * VEHICLE_ICON_SCALE));
     const h = Math.max(Math.round(w * VEHICLE_ICON_RATIO), w);
     const imageUrl = (VEHICLE_ICON_STATUS === 'fail') ? generateVehicleFallbackDataUrl(w, h) : VEHICLE_ICON_PATH;
     return new AMap.Icon({
@@ -1235,7 +1238,8 @@ function applyVehicleIconIfNavigating() {
                 if (typeof userMarker.setIcon === 'function') {
                     userMarker.setIcon(icon);
                 }
-                const w = getRouteVisualWidth();
+                const baseW = getRouteVisualWidth();
+                const w = Math.max(1, Math.round(baseW * VEHICLE_ICON_SCALE));
                 const h = Math.max(Math.round(w * VEHICLE_ICON_RATIO), w);
                 if (typeof userMarker.setOffset === 'function') {
                     userMarker.setOffset(new AMap.Pixel(-(w / 2), -(h / 2)));
@@ -4850,7 +4854,7 @@ function updatePathSegments(currentPos, fullPath, segIndex, projectionPoint) {
             passedSegmentPolylines[currentSegmentNumber] = new AMap.Polyline({
                 path: passedPath,
                 strokeColor: '#9E9E9E',
-                strokeWeight: 8,
+                strokeWeight: getRouteVisualWidth(),
                 strokeOpacity: 0.9,
                 lineJoin: 'round',
                 lineCap: 'round',
@@ -4861,6 +4865,7 @@ function updatePathSegments(currentPos, fullPath, segIndex, projectionPoint) {
         } else {
             // 更新当前分段的灰色路径
             passedSegmentPolylines[currentSegmentNumber].setPath(passedPath);
+            try { passedSegmentPolylines[currentSegmentNumber].setOptions({ strokeWeight: getRouteVisualWidth() }); } catch (e) {}
             console.log('更新第', currentSegmentNumber, '段灰色路径，长度:', passedPath.length, '点');
         }
 
