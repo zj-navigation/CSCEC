@@ -41,6 +41,28 @@ let navTTSQueue = [];
 let navTTSSpeaking = false;
 let navTTSSuppressionUntil = 0; // 时间戳：在此之前忽略重复播报
 
+// 最近一次播报记录（用于按距离分段节流，避免每秒提示不同距离而产生频繁语音）
+let navLastPrompt = {
+    time: 0,
+    type: '',       // 'left'|'right'|'straight'|'uturn'|'offroute'|'start'
+    distanceBand: -1, // 按距离分段的带编号
+    text: ''
+};
+
+// 根据距离和动作类型返回建议的最小播报间隔（毫秒）
+function getPromptIntervalMs(distanceMeters, directionType) {
+    // 优先根据距离分段
+    const d = Math.max(0, Math.round(distanceMeters || 0));
+    // 更粗的分段策略： >200m:30s, 100-200:20s, 50-100:10s, 20-50:5s, 8-20:3s, <8:1s
+    if (d > 200) return 30000;
+    if (d > 100) return 20000;
+    if (d > 50) return 10000;
+    if (d > 20) return 5000;
+    if (d > 8) return 3000;
+    // 极近距离，允许快速重复提示（但主队列仍有短暂抑制）
+    return 1000;
+}
+
 function initNavTTS() {
     try {
         // 优先使用全局配置 MapConfig.xfyun（若存在）
@@ -2353,63 +2375,123 @@ function updateNavigationTip() {
     }
 
     
-    // 调试日志 + 语音播报
+    // 调试日志 + 语音播报（使用稳定方向 & 节流控制）
+    try {
+        console.log('导航提示更新:', {
+            directionType,
+            distanceToNext: Math.round(distanceToNext || 0),
+            nextTurnIndex,
+            currentNavigationIndex
+        });
+
+        // 添加转向稳定性检查，避免频繁切换
+        let stableDirectionType = directionType;
         try {
-            console.log('导航提示更新:', {
-                directionType,
-                distanceToNext: Math.round(distanceToNext || 0),
-                nextTurnIndex,
-                currentNavigationIndex
-            });
-
-            // 添加转向稳定性检查，避免频繁切换
-            let stableDirectionType = directionType;
-            try {
-                // 如果有上一次的方向类型，检查是否稳定
-                if (lastDirectionType) {
-                    // 如果距离大于30米，才允许改变方向类型，避免在小范围内频繁切换
-                    if (distanceToNext > 30 || lastDirectionType === directionType) {
-                        stableDirectionType = directionType;
-                    } else {
-                        // 保持上一次的方向类型，增加稳定性
-                        stableDirectionType = lastDirectionType;
-                    }
+            // 如果有上一次的方向类型，检查是否稳定
+            if (lastDirectionType) {
+                // 如果距离大于20米，允许改变方向类型；在小距离内优先保持上一次提示，降低抖动
+                if (distanceToNext > 20 || lastDirectionType === directionType) {
+                    stableDirectionType = directionType;
+                } else {
+                    stableDirectionType = lastDirectionType;
                 }
-                // 保存当前方向类型
-                lastDirectionType = stableDirectionType;
-            } catch (e) { /* 忽略错误 */ }
-
-            // 生成播放文案（简单规则）：
-            try {
-                const d = Math.round(distanceToNext || 0);
-                let msg = '';
-                if (directionType === 'left' || directionType === 'right' || directionType === 'uturn' || directionType === 'backward') {
-                    // 近距离提示使用“现在...”，否则使用“前方X米处...”
-                    if (d <= 8) {
-                        if (directionType === 'left') msg = '请现在左转';
-                        else if (directionType === 'right') msg = '请现在右转';
-                        else if (directionType === 'uturn' || directionType === 'backward') msg = '请在就地掉头';
-                    } else {
-                        if (directionType === 'left') msg = `前方${d}米处左转`;
-                        else if (directionType === 'right') msg = `前方${d}米处右转`;
-                        else if (directionType === 'uturn' || directionType === 'backward') msg = `前方${d}米处掉头`;
-                    }
-                } else if (directionType === 'forward' || directionType === 'straight') {
-                    if (d <= 20) msg = '继续直行';
-                    else msg = `继续直行，约${d}米`;
-                } else if (directionType === 'offroute') {
-                    msg = '您已偏离路线，请尽快回到规划路线';
-                }
-
-                if (msg) {
-                    // 限制短时间内重复播报，增加抑制时间到3秒，避免重复播报
-                    speakNavigation(msg, { suppressionMs: 3000 });
-                }
-            } catch (e) {
-                console.warn('生成语音提示失败:', e);
             }
-        } catch (e) {}
-        updateDirectionIcon(directionType, distanceToNext);
+            lastDirectionType = stableDirectionType;
+        } catch (e) { /* 忽略错误 */ }
+
+        // 语音播报：未到达起点时，只播报"请前往起点"（限频），不要播转弯提示
+        if (!hasReachedStart) {
+            try {
+                const now = Date.now();
+                const startMsg = '请前往起点';
+                // 最少10秒播报一次起点提示
+                if (now - navLastPrompt.time > 10000 || navLastPrompt.type !== 'start' || navLastPrompt.text !== startMsg) {
+                    speakNavigation(startMsg, { suppressionMs: 5000 });
+                    navLastPrompt.time = now;
+                    navLastPrompt.type = 'start';
+                    navLastPrompt.distanceBand = -1;
+                    navLastPrompt.text = startMsg;
+                }
+            } catch (e) { console.warn('未到起点播报失败:', e); }
+
+            // 更新UI并返回（UI中会处理前往起点的显示）
+            updateDirectionIcon(stableDirectionType, distanceToNext);
+            return;
+        }
+
+        // 到达起点后正常按距离/动作分段播报
+        try {
+            const d = Math.round(distanceToNext || 0);
+            let msg = '';
+            const dir = stableDirectionType;
+
+            if (dir === 'left' || dir === 'right' || dir === 'uturn' || dir === 'backward') {
+                if (d <= 8) {
+                    if (dir === 'left') msg = '请现在左转';
+                    else if (dir === 'right') msg = '请现在右转';
+                    else if (dir === 'uturn' || dir === 'backward') msg = '请在就地掉头';
+                } else {
+                    if (dir === 'left') msg = `前方${d}米处左转`;
+                    else if (dir === 'right') msg = `前方${d}米处右转`;
+                    else if (dir === 'uturn' || dir === 'backward') msg = `前方${d}米处掉头`;
+                }
+            } else if (dir === 'forward' || dir === 'straight') {
+                if (d <= 20) msg = '继续直行';
+                else msg = `继续直行，约${d}米`;
+            } else if (dir === 'offroute') {
+                msg = '您已偏离路线，请尽快回到规划路线';
+            }
+
+            if (msg) {
+                const now = Date.now();
+                // 根据距离计算合适的间隔
+                const interval = getPromptIntervalMs(distanceToNext, dir);
+                // 简单的距离分段编号，便于判断是否进入新区间
+                let band = 0;
+                if (d > 200) band = 5;
+                else if (d > 100) band = 4;
+                else if (d > 50) band = 3;
+                else if (d > 20) band = 2;
+                else if (d > 8) band = 1;
+                else band = 0;
+
+                let shouldSpeak = false;
+
+                // 若方向类别与上一次不同，优先播报（但仍遵守最短间隔1s）
+                if (navLastPrompt.type !== dir) {
+                    shouldSpeak = true;
+                }
+
+                // 若进入不同距离分段，也优先播报
+                if (!shouldSpeak && navLastPrompt.distanceBand !== band) {
+                    shouldSpeak = true;
+                }
+
+                // 若足够时间已过，则播报
+                if (!shouldSpeak && (now - navLastPrompt.time >= interval)) {
+                    shouldSpeak = true;
+                }
+
+                // 近距离的紧急提示（<=8m）强制播报
+                if (d <= 8) shouldSpeak = true;
+
+                if (shouldSpeak) {
+                    // 将 suppressionMs 设为 interval 的一半（但不超过3000）
+                    const suppressionMs = Math.min(Math.max(500, Math.floor(interval / 2)), 3000);
+                    speakNavigation(msg, { suppressionMs });
+                    navLastPrompt.time = now;
+                    navLastPrompt.type = dir;
+                    navLastPrompt.distanceBand = band;
+                    navLastPrompt.text = msg;
+                }
+            }
+        } catch (e) {
+            console.warn('生成语音提示失败:', e);
+        }
+    } catch (e) {}
+
+    // 用稳定方向更新UI，确保语音与上方显示同步
+    updateDirectionIcon(stableDirectionType, distanceToNext);
     
 }
 
