@@ -408,7 +408,7 @@ function hideError(msgElement) {
 function initProjectSelection() {
     // 项目数据
     const projectsData = {
-        '江苏省': ['胥江一号项目', '苏州丰隆项目', '圆融国际广场项目', '汇川联合动力项目'],
+        '江苏省': ['胥江一号项目', '苏州丰隆项目', '圆融国际广场项目', '汇川动力总部项目'],
         '湖北省': ['汉韵公馆项目', '葛店试验场项目','测试项目']
     };
 
