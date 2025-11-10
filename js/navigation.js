@@ -4665,12 +4665,16 @@ function stopSimulatedNavigation() {
 function updatePathSegments(currentPos, fullPath, snapIndex, unused) {
     if (!routePolyline || !fullPath || fullPath.length < 2) return;
 
-    // 使用吸附逻辑：将增强路径点索引转换为原始路径索引
-    const routePoint = currentPos; // 已经是吸附后的位置
+    // 始终以“当前点到路网的投影”作为路网上的展示锚点，避免出现“实际位置→路网”的连接线
+    const projOnRoute = projectPointOntoPathMeters(currentPos, fullPath);
+    const routePoint = projOnRoute ? projOnRoute.projected : currentPos;
 
     // 关键：snapIndex 是增强路径点的索引，需要转换为原始路径索引
     let routeSegIndex = 0;
-    if (typeof snapIndex === 'number' && snapIndex >= 0 && enhancedPathPoints && enhancedPathPoints[snapIndex]) {
+    if (projOnRoute && typeof projOnRoute.index === 'number') {
+        // 优先使用投影得到的线段索引，确保灰/绿分割严格锚定在路网上
+        routeSegIndex = projOnRoute.index;
+    } else if (typeof snapIndex === 'number' && snapIndex >= 0 && enhancedPathPoints && enhancedPathPoints[snapIndex]) {
         routeSegIndex = enhancedPathPoints[snapIndex].originalIndex || 0;
     } else {
         routeSegIndex = maxPassedOriginalIndex >= 0 ? maxPassedOriginalIndex : 0;
@@ -4695,38 +4699,30 @@ function updatePathSegments(currentPos, fullPath, snapIndex, unused) {
         maxPassedSegIndex = routeSegIndex;
     }
 
-    // 处理偏离路径的情况
-    // 只有在已到达起点后，才记录和显示偏离轨迹
+    // 处理偏离路径的情况：偏离时用“黄色虚线”仅连接【实际位置→路网投影点】；不保留历史轨迹
     if (!onRoute && hasReachedStart) {
-        // 添加当前位置到偏离路径（使用实际GPS位置，不是投影点）
-        if (deviatedPath.length === 0 ||
-            calculateDistanceBetweenPoints(currentPos, deviatedPath[deviatedPath.length - 1]) > 2) {
-            // 只有当移动超过2米才添加新点，避免过于密集
-            deviatedPath.push(currentPos);
-        }
-
-        // 创建或更新黄色偏离路径
-        if (deviatedPath.length >= 2) {
+        // 计算投影点，作为连线终点
+        if (projOnRoute && projOnRoute.projected) {
+            const connectorPath = [currentPos, projOnRoute.projected];
             if (!deviatedRoutePolyline) {
                 deviatedRoutePolyline = new AMap.Polyline({
-                    path: deviatedPath,
+                    path: connectorPath,
                     strokeColor: '#FFC107', // 黄色
                     strokeWeight: 6,
-                    strokeOpacity: 0.8,
+                    strokeOpacity: 0.9,
                     strokeStyle: 'dashed', // 虚线样式
                     lineJoin: 'round',
                     lineCap: 'round',
                     zIndex: 115, // 在灰色路径之上，绿色路径之下
                     map: navigationMap
                 });
-                console.log('创建黄色偏离路径，长度:', deviatedPath.length, '点');
             } else {
-                deviatedRoutePolyline.setPath(deviatedPath);
-                console.log('更新黄色偏离路径，长度:', deviatedPath.length, '点');
+                deviatedRoutePolyline.setPath(connectorPath);
+                if (!deviatedRoutePolyline.getMap()) deviatedRoutePolyline.setMap(navigationMap);
             }
         }
-
-        // 偏离时：保留已走灰线，体现完整历史，不再根据"trail/history"模式隐藏
+        // 不记录偏离历史
+        deviatedPath = [];
     } else {
         // 回到路线上时，清除偏离路径
         if (deviatedRoutePolyline) {
@@ -4765,29 +4761,31 @@ function updatePathSegments(currentPos, fullPath, snapIndex, unused) {
         }
     }
 
-    // 当前分段内走过的路径：从分段起点到"当前投影点"实时延伸
-    // 实时延伸：直接使用当前投影点所在索引，确保灰线跟随小车图标
+    // 逐段显示逻辑：当前“腿”= 从 segmentStartIndex 到 endIndex（途径点或终点）
+    // 如果全局投影索引 routeSegIndex 跳出了当前腿范围，不让它驱动分割，保持绿线从腿起点开始
+    let effectiveIndex = routeSegIndex;
+    if (effectiveIndex < segmentStartIndex || effectiveIndex > endIndex) {
+        // 越界：说明用户在下一段附近或尚未进入本段，灰线不存在，整段显示为绿色
+        effectiveIndex = segmentStartIndex;
+    }
+
     if (fullPath && fullPath.length > 0) {
-        // 使用当前投影索引作为终点，不再依赖maxPassedOriginalIndex
-        const currentEndIndex = Math.max(segmentStartIndex, Math.min(routeSegIndex, fullPath.length - 1));
-
-        // 切片：从分段起点到当前投影点
-        const sliceEnd = Math.min(currentEndIndex + 1, fullPath.length);
-        passedPath = fullPath.slice(segmentStartIndex, sliceEnd);
-
-        // 将当前投影点（routePoint）精确追加到末尾，确保完全对齐
-        if (routePoint && passedPath.length > 0) {
-            const lastP = passedPath[passedPath.length - 1];
-            const distLast = lastP ? calculateDistanceBetweenPoints(lastP, routePoint) : Infinity;
-            // 如果投影点与路径末点有距离差异，替换末点为精确投影点
-            if (distLast > 0.2) {
-                passedPath.push(routePoint);
-            } else if (distLast > 0.01) {
-                // 距离很小但不为0时，替换最后一个点为精确投影点
-                passedPath[passedPath.length - 1] = routePoint;
+        // 灰线：仅当有效投影点在腿内部且不在起点时才显示已走部分
+        if (effectiveIndex > segmentStartIndex) {
+            const currentEndIndex = Math.min(effectiveIndex, endIndex);
+            const sliceEnd = Math.min(currentEndIndex + 1, fullPath.length);
+            passedPath = fullPath.slice(segmentStartIndex, sliceEnd);
+            if (routePoint && passedPath.length > 0) {
+                const lastP = passedPath[passedPath.length - 1];
+                const distLast = lastP ? calculateDistanceBetweenPoints(lastP, routePoint) : Infinity;
+                if (distLast > 0.2) {
+                    passedPath.push(routePoint);
+                } else if (distLast > 0.01) {
+                    passedPath[passedPath.length - 1] = routePoint;
+                }
             }
         }
-        console.log('[实时灰线] 第', currentSegmentNumber, '段：起点索引', segmentStartIndex, '当前投影索引', routeSegIndex, '灰点数', passedPath.length);
+        console.log('[逐段灰线] 第', currentSegmentNumber, '段：起点', segmentStartIndex, '有效索引', effectiveIndex, '灰点数', passedPath.length);
     }
 
     // 构建剩余路径（绿色）- 从实际走过的最远点到目标点
@@ -4807,15 +4805,13 @@ function updatePathSegments(currentPos, fullPath, snapIndex, unused) {
         console.error('确定终点索引失败:', e);
     }
 
-    // 绿色路径从"当前投影点"开始（实时），确保与灰线衔接
-    const startIdx = Math.max(0, routeSegIndex);
+    // 绿色路径：始终限制在当前腿范围内，从 (灰线末尾或腿起点) 到腿终点
+    const startIdx = (passedPath.length >= 2) ? Math.max(segmentStartIndex, Math.min(routeSegIndex, endIndex)) : segmentStartIndex;
     const sliceEnd = Math.min(endIndex + 1, fullPath.length);
     if (startIdx < fullPath.length && startIdx < sliceEnd) {
         remainingPath = fullPath.slice(startIdx, sliceEnd);
-
-        // 确保绿色路径起点是当前投影点，与灰色路径终点精确衔接
-        if (routePoint && remainingPath.length > 0) {
-            // 将绿色路径的第一个点替换为精确投影点
+        // 如果有灰线，绿色起点替换为投影点；否则保持腿起点
+        if (passedPath.length >= 2 && routePoint && remainingPath.length > 0) {
             remainingPath[0] = routePoint;
         }
 
