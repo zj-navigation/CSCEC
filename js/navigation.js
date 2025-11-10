@@ -3074,10 +3074,19 @@ function navApplyHeadingToMarker(rawHeading) {
             console.log('[nav heading]', { heading, angleOffset, mapRotation, finalAngle });
         }
 
-        // 如果已经到达起点并开始导航，则锁定为路网方向，不再随设备或微移动抖动：
-        // 路网方向此处直接使用传入的 rawHeading（已按路径计算），忽略动态设备偏移后的结果。
+        // 如果已经到达起点并开始导航：完全锁定为“路径方向”
+        // 逻辑：
+        // 1) 不再使用设备罗盘；
+        // 2) 角度基于当前路径点到下一个路径点的 bearing；
+        // 3) 可配置是否扣除地图旋转（默认扣除，保持视觉指向地图真实行进方向）。
         if (hasReachedStart && isNavigating) {
-            finalAngle = heading; // 使用路径方向(未减地图旋转)，保持与路线平行视觉
+            let lockSubtractRotation = true;
+            try {
+                if (MapConfig && MapConfig.navigationConfig && typeof MapConfig.navigationConfig.lockHeadingSubtractMapRotation === 'boolean') {
+                    lockSubtractRotation = MapConfig.navigationConfig.lockHeadingSubtractMapRotation;
+                }
+            } catch (e) {}
+            finalAngle = lockSubtractRotation ? ((heading - mapRotation + 360) % 360) : heading;
         }
 
         if (typeof userMarker.setAngle === 'function') userMarker.setAngle(finalAngle);
@@ -4977,6 +4986,11 @@ function tryStartDeviceOrientationNav() {
         deviceOrientationHandlerNav = function(e) {
             if (!e) return;
             let heading = null;
+
+            // 到达起点并导航中：直接忽略设备方向事件（保持路径方向锁定）
+            if (hasReachedStart && isNavigating) {
+                return; // 不再更新 lastDeviceHeadingNav，也不触发提示刷新
+            }
 
             // iOS Safari 提供 webkitCompassHeading（0-360，参考真北）
             if (typeof e.webkitCompassHeading === 'number' && !isNaN(e.webkitCompassHeading)) {
