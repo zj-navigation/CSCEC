@@ -124,12 +124,20 @@ const MapConfig = {
         minSegmentLengthMeters: 1.5,
         // 短段聚合角度的最小聚合长度（米）：当相邻线段过短时，聚合前后各若干米再计算夹角，避免漏检
         turnClusterMinMeters: 5,
-        // 转向角度阈值（度），小于该角度视为直行
+        // 转向角度阈值（度），小于该角度视为直行（原始路径点使用，已弃用）
         turnAngleThresholdDegrees: 28,
         // 通过一个转向后，最少等待多久再显示下一条指示（毫秒），避免连跳
         postTurnNextPromptMinTimeMs: 1500,
         // 提示模式：'path'（基于路网，默认）或 'heading'（基于用户朝向）
-        promptMode: 'path'
+        promptMode: 'path',
+
+        // === 增强路径点转向检测配置（推荐使用） ===
+        // 增强路径点转向角度阈值（度），小于该角度视为直行
+        enhancedTurnAngleThreshold: 20,
+        // 增强路径点采样距离（米）：每隔N米采样计算角度，用于平滑转盘弧形
+        enhancedSampleDistance: 10,
+        // 增强路径点转向合并间距（米）：N米内的转向点会被合并，保留角度更大的
+        enhancedTurnMergeGap: 15
     }
 };
 

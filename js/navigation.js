@@ -2736,9 +2736,11 @@ function buildTurnSequenceFromEnhanced(enhancedPoints) {
     const seq = [];
     if (!enhancedPoints || enhancedPoints.length < 3) return seq;
 
-    // 配置：转向角度阈值（使用更低的阈值，因为增强点更密集）
-    let TURN_ANGLE_THRESHOLD = 15; // 降低阈值，检测更平缓的转弯
+    // 配置：转向角度阈值（统一使用增强路径点配置）
+    let TURN_ANGLE_THRESHOLD = 20; // 默认20度，过滤转盘弧形
     let SAMPLE_DISTANCE_M = 10;     // 采样距离：每隔10米的点来计算角度
+    let MIN_TURN_GAP_M = 15;        // 转向点合并间距
+
     try {
         if (MapConfig && MapConfig.navigationConfig) {
             if (typeof MapConfig.navigationConfig.enhancedTurnAngleThreshold === 'number') {
@@ -2747,10 +2749,13 @@ function buildTurnSequenceFromEnhanced(enhancedPoints) {
             if (typeof MapConfig.navigationConfig.enhancedSampleDistance === 'number') {
                 SAMPLE_DISTANCE_M = MapConfig.navigationConfig.enhancedSampleDistance;
             }
+            if (typeof MapConfig.navigationConfig.enhancedTurnMergeGap === 'number') {
+                MIN_TURN_GAP_M = MapConfig.navigationConfig.enhancedTurnMergeGap;
+            }
         }
     } catch (e) {}
 
-    console.log('[转向序列] 使用增强路径点检测，阈值:', TURN_ANGLE_THRESHOLD, '度，采样距离:', SAMPLE_DISTANCE_M, '米');
+    console.log('[转向序列] 使用增强路径点检测 - 角度阈值:', TURN_ANGLE_THRESHOLD, '度, 采样距离:', SAMPLE_DISTANCE_M, '米, 合并间距:', MIN_TURN_GAP_M, '米');
 
     // 遍历增强路径点，使用固定距离采样计算角度
     for (let i = 0; i < enhancedPoints.length; i++) {
@@ -2807,13 +2812,6 @@ function buildTurnSequenceFromEnhanced(enhancedPoints) {
     }
 
     // 去重：合并距离很近的转向点（保留角度更大的）
-    let MIN_TURN_GAP_M = 15; // 增强路径点密集，可以用更大的去重距离
-    try {
-        if (MapConfig && MapConfig.navigationConfig && typeof MapConfig.navigationConfig.enhancedTurnMergeGap === 'number') {
-            MIN_TURN_GAP_M = MapConfig.navigationConfig.enhancedTurnMergeGap;
-        }
-    } catch (e) {}
-
     const pruned = [];
     for (let i = 0; i < seq.length; i++) {
         const curr = seq[i];
@@ -4172,7 +4170,7 @@ function startRealNavigationTracking() {
 
                         // === 语音提示：已到达起点 ===
                         try {
-                            speakNavigationTip('已到达起点，开始导航');
+                            speakNavigation('已到达起点，开始导航');
                         } catch (e) {
                             console.warn('播放起点提示失败:', e);
                         }
@@ -4366,12 +4364,14 @@ function startRealNavigationTracking() {
                 updateNavigationTip();
             }
 
-            // 到终点判定（精确索引匹配）
+            // 到终点判定（索引范围匹配，允许±2个索引的误差）
             const endIndex = fullPath.length - 1;
+            const END_INDEX_TOLERANCE = 2; // 索引容差：允许±2个索引的误差
 
-            // 只有当吸附到终点索引时才算到达
-            if (hasReachedStart && onRoute && maxPassedOriginalIndex === endIndex) {
-                console.log('到达终点 (路径索引:', endIndex, ')');
+            // 改进判定：索引差值在容差范围内即认为到达终点
+            const indexDiffToEnd = Math.abs(maxPassedOriginalIndex - endIndex);
+            if (hasReachedStart && onRoute && indexDiffToEnd <= END_INDEX_TOLERANCE) {
+                console.log('到达终点 (路径索引:', endIndex, ', 当前索引:', maxPassedOriginalIndex, ', 索引差:', indexDiffToEnd, ')');
                 finishNavigation();
                 // 到达后停止持续定位
                 stopRealNavigationTracking();
@@ -4426,19 +4426,21 @@ function getNearestUnvisitedWaypointDistanceMeters(currPos, path, wptMap) {
 function markWaypointArrivalIfNeeded(currPos, path) {
     if (!Array.isArray(path) || path.length < 2 || !Array.isArray(waypointIndexMap) || waypointIndexMap.length === 0) return;
 
-    // === 基于精确索引匹配判断途径点到达 ===
-    // 只有当实际走过的最远索引精确等于途径点索引时才算到达
+    // === 基于索引范围匹配判断途径点到达（允许±2个索引的误差） ===
     if (maxPassedOriginalIndex < 0) return; // 还没有吸附到任何点
+
+    const INDEX_TOLERANCE = 2; // 索引容差：允许±2个索引的误差
 
     for (let i = 0; i < waypointIndexMap.length; i++) {
         const w = waypointIndexMap[i];
         if (!w || visitedWaypoints.has(w.name)) continue;
         if (typeof w.index !== 'number') continue;
 
-        // 精确匹配：吸附到途径点的路径索引才算到达
-        if (maxPassedOriginalIndex === w.index) {
+        // 改进判定：索引差值在容差范围内即认为到达
+        const indexDiff = Math.abs(maxPassedOriginalIndex - w.index);
+        if (indexDiff <= INDEX_TOLERANCE) {
             visitedWaypoints.add(w.name);
-            console.log('到达途径点:', w.name, '(路径索引:', w.index, ')');
+            console.log('到达途径点:', w.name, '(路径索引:', w.index, ', 当前索引:', maxPassedOriginalIndex, ', 索引差:', indexDiff, ')');
 
             // === 计算途径点序号并播报 ===
             const waypointNumber = i + 1; // 序号从1开始
@@ -4454,7 +4456,7 @@ function markWaypointArrivalIfNeeded(currPos, path) {
             }
 
             try {
-                speakNavigationTip(tipMessage);
+                speakNavigation(tipMessage);
                 console.log('播报:', tipMessage);
             } catch (e) {
                 console.warn('播放途径点提示失败:', e);
