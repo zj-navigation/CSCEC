@@ -1975,6 +1975,12 @@ function startNavigationUI() {
 
     console.log('导航已开始');
     try { speakNavigation('导航已开始，请注意行车安全'); } catch (e) {}
+    // 若尚未到达起点，立即播报一次“请前往起点”，确保用户在开始时能听到引导
+    try {
+        if (!hasReachedStart) {
+            speakNavigation('请前往起点', { suppressionMs: 10000 });
+        }
+    } catch (e) { console.warn('启动时播报前往起点失败:', e); }
 }
 
 // 停止导航UI
